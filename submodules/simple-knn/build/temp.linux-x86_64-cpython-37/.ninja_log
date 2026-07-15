@@ -1,0 +1,5 @@
+# ninja log v5
+0	5043	1732259487600377857	/data3/isyang/Workspace/4DGaussians/submodules/simple-knn/build/temp.linux-x86_64-cpython-37/simple_knn.o	c2506a2e717f8c87
+0	11624	1732259494168490609	/data3/isyang/Workspace/4DGaussians/submodules/simple-knn/build/temp.linux-x86_64-cpython-37/ext.o	805aac1c217d6d94
+1	25645	1732259508200730663	/data3/isyang/Workspace/4DGaussians/submodules/simple-knn/build/temp.linux-x86_64-cpython-37/spatial.o	104f7dc273e0c237
+11	14147	1737769356213722141	/data3/isyang/Workspace/4DGaussians/submodules/simple-knn/build/temp.linux-x86_64-cpython-37/ext.o	805aac1c217d6d94

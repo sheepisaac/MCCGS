@@ -1,0 +1,17 @@
+output/
+data/
+viewers/
+viewers.zip
+*.mp4
+*.ply
+*.pth
+*.ckpt
+*.pt
+*.tar
+*.zip
+__pycache__/
+*.pyc
+.DS_Store
+runs/
+wandb/
+events.out.tfevents.*
