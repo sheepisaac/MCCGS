@@ -1,0 +1,17 @@
+MCCGS: Movable Camera Cluster Gaussian Splatting
+
+This repository is derived from and built on top of:
+
+  4DGaussians: 4D Gaussian Splatting for Real-Time Dynamic Scene Rendering
+  https://github.com/hustvl/4DGaussians
+
+The original 4DGaussians code is distributed under the Apache License,
+Version 2.0. The Apache License text is preserved in LICENSE.md.
+
+MCCGS modifications include movable-camera-cluster dataset handling,
+frame-aware timestamps, pose refinement, motion-compensated Gaussian
+propagation, and posterior-guided Gaussian completion.
+
+This repository also depends on components from 3D Gaussian Splatting and
+its rasterization/simple-knn submodules. Users should check the licenses of
+the upstream projects and submodules before redistribution or commercial use.

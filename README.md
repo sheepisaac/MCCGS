@@ -174,3 +174,15 @@ This codebase is built on top of:
 - [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting)
 
 Please cite the original 4DGS and 3DGS papers when using this repository.
+
+## License
+
+This repository is a derivative research prototype based on
+[4DGaussians](https://github.com/hustvl/4DGaussians), which is distributed
+under the Apache License 2.0. The Apache 2.0 license text is preserved in
+[LICENSE.md](LICENSE.md), and upstream attribution is recorded in
+[NOTICE](NOTICE).
+
+Some dependencies and submodules originate from 3D Gaussian Splatting and
+related projects. Please check the upstream licenses before redistribution or
+commercial use.
