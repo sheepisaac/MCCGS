@@ -1,50 +1,73 @@
-# 4D Gaussian Splatting for Real-Time Dynamic Scene Rendering
+# MCCGS: Movable Camera Cluster Gaussian Splatting
 
-## CVPR 2024
+MCCGS is a research prototype for reconstructing dynamic scenes captured by a **movable camera cluster** into a unified 4D Gaussian representation.
 
-### [Project Page](https://guanjunwu.github.io/4dgs/index.html)| [arXiv Paper](https://arxiv.org/abs/2310.08528)
+This repository is based on [4DGaussians](https://github.com/hustvl/4DGaussians), with experimental changes for movable multi-camera capture, frame-aware timestamps, pose refinement, and posterior-guided Gaussian completion.
 
-[Guanjun Wu](https://guanjunwu.github.io/) <sup>1*</sup>, [Taoran Yi](https://github.com/taoranyi) <sup>2*</sup>,
-[Jiemin Fang](https://jaminfong.cn/) <sup>3‡</sup>, [Lingxi Xie](http://lingxixie.com/) <sup>3 </sup>, </br>[Xiaopeng Zhang](https://scholar.google.com/citations?user=Ud6aBAcAAAAJ&hl=zh-CN) <sup>3 </sup>, [Wei Wei](https://www.eric-weiwei.com/) <sup>1 </sup>,[Wenyu Liu](http://eic.hust.edu.cn/professor/liuwenyu/) <sup>2 </sup>, [Qi Tian](https://www.qitian1987.com/) <sup>3 </sup> , [Xinggang Wang](https://xwcv.github.io) <sup>2‡✉</sup>
+> Status: early research code. The implementation is intended for rapid experiments and ablations rather than polished general-purpose use.
 
-<sup>1 </sup>School of CS, HUST &emsp; <sup>2 </sup>School of EIC, HUST &emsp; <sup>3 </sup>Huawei Inc. &emsp;
+## Motivation
 
-<sup>\*</sup> Equal Contributions. <sup>$\ddagger$</sup> Project Lead. <sup>✉</sup> Corresponding Author.
+Standard 4D Gaussian Splatting assumes that the dynamic scene can be represented from available observations with a shared canonical Gaussian set and a time-dependent deformation field. In movable camera cluster capture, however, each frame and each camera view can expose different regions of the scene. This creates a harder problem:
 
+```text
+Given sparse and uneven view-time observations,
+infer a globally aligned 4D Gaussian hypothesis set
+that can explain both observed regions and plausible missing regions.
+```
 
+MCCGS explores this as a posterior-guided Gaussian hypothesis problem:
 
-![block](assets/teaserfig.jpg)
-Our method converges very quickly and achieves real-time rendering speed.
+- Existing Gaussians explain observed view-time evidence.
+- Unexplained residuals and uncertain motion indicate missing hypotheses.
+- New Gaussians are proposed conservatively as hypotheses.
+- Hypotheses are optimized, retained, or pruned through multi-view/time evidence.
 
-New Colab demo:[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1wz0D5Y9egAlcxXy8YO9UmpQ9oH51R7OW?usp=sharing) (Thanks [Tasmay-Tibrewal
-](https://github.com/Tasmay-Tibrewal))
+## Current Features
 
-Old Colab demo:[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hustvl/4DGaussians/blob/master/4DGaussians.ipynb) (Thanks [camenduru](https://github.com/camenduru/4DGaussians-colab).)
+- Frame-aware timestamp parsing for COLMAP-style movable camera cluster datasets.
+- Frame-level camera pose refinement.
+- Motion-compensated Gaussian propagation.
+- Bayesian-style posterior scoring for conservative Gaussian completion.
+- Render-time loading of learned pose correction.
+- Per-frame 3DGS export utilities for comparison/debugging.
 
-Light Gaussian implementation: [This link](https://github.com/pablodawson/4DGaussians) (Thanks [pablodawson](https://github.com/pablodawson))
+The current best experimental direction is the `r5` setting:
 
+```text
+pose refinement
++ weak motion compensation
++ posterior-guided conservative Gaussian birth
+```
 
-## News
+## Repository Layout
 
-2024.6.25: we clean the code and add an explanation of the parameters.
+```text
+arguments/
+  movable_camera_cluster.py        # MCCGS experiment config
+  movable_camera_cluster_pure10.py # pure 4DGS 10-frame baseline config
 
-2024.3.25: Update guidance for hypernerf and dynerf dataset.
+scene/
+  dataset_readers.py               # frame-aware COLMAP reader
+  cameras.py                       # camera metadata with frame_id
+  gaussian_model.py                # Gaussian model and conservative birth helper
 
-2024.03.04: We change the hyperparameters of the Neu3D dataset, corresponding to our paper.
+utils/
+  pose_correction.py               # frame-level pose refinement
+  gaussian_birth.py                # earlier MLP-assisted birth prototype
+  motion_compensation.py           # posterior-guided motion/completion controller
 
-2024.02.28: Update SIBR viewer guidance.
+train.py                           # training loop with MCCGS options
+render.py                          # rendering with optional pose correction
+export_perframe_3DGS.py            # per-time Gaussian export utility
+```
 
-2024.02.27: Accepted by CVPR 2024. We delete some logging settings for debugging, the corrected training time is only **8 mins** (20 mins before) in D-NeRF datasets and **30 mins** (1 hour before) in HyperNeRF datasets. The rendering quality is not affected.
+## Environment
 
-## Environmental Setups
-
-Please follow the [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting) to install the relative packages.
+Follow the original 4DGS setup and install the rasterization submodules:
 
 ```bash
-git clone https://github.com/hustvl/4DGaussians
-cd 4DGaussians
-git submodule update --init --recursive
-conda create -n Gaussians4D python=3.7 
+conda create -n Gaussians4D python=3.7
 conda activate Gaussians4D
 
 pip install -r requirements.txt
@@ -52,271 +75,102 @@ pip install -e submodules/depth-diff-gaussian-rasterization
 pip install -e submodules/simple-knn
 ```
 
-In our environment, we use pytorch=1.13.1+cu116.
+The development environment used for these experiments:
 
-## Data Preparation
-
-**For synthetic scenes:**
-The dataset provided in [D-NeRF](https://github.com/albertpumarola/D-NeRF) is used. You can download the dataset from [dropbox](https://www.dropbox.com/s/0bf6fl0ye2vz3vr/data.zip?dl=0).
-
-**For real dynamic scenes:**
-The dataset provided in [HyperNeRF](https://github.com/google/hypernerf) is used. You can download scenes from [Hypernerf Dataset](https://github.com/google/hypernerf/releases/tag/v0.1) and organize them as [Nerfies](https://github.com/google/nerfies#datasets). 
-
-Meanwhile, [Plenoptic Dataset](https://github.com/facebookresearch/Neural_3D_Video) could be downloaded from their official websites. To save the memory, you should extract the frames of each video and then organize your dataset as follows.
-
-```
-├── data
-│   | dnerf 
-│     ├── mutant
-│     ├── standup 
-│     ├── ...
-│   | hypernerf
-│     ├── interp
-│     ├── misc
-│     ├── virg
-│   | dynerf
-│     ├── cook_spinach
-│       ├── cam00
-│           ├── images
-│               ├── 0000.png
-│               ├── 0001.png
-│               ├── 0002.png
-│               ├── ...
-│       ├── cam01
-│           ├── images
-│               ├── 0000.png
-│               ├── 0001.png
-│               ├── ...
-│     ├── cut_roasted_beef
-|     ├── ...
+```text
+PyTorch 1.13.1 + CUDA 11.7
+NVIDIA RTX 4090
 ```
 
-**For multipleviews scenes:**
-If you want to train your own dataset of multipleviews scenes, you can orginize your dataset as follows:
+## Dataset Format
 
+MCCGS expects a COLMAP-style dataset after preprocessing:
+
+```text
+dataset_root/
+  input/
+    frame_0001_view_01.png
+    frame_0001_view_02.png
+    ...
+  sparse/0/
+    cameras.bin
+    images.bin
+    points3D.bin
 ```
-├── data
-|   | multipleview
-│     | (your dataset name) 
-│   	  | cam01
-|     		  ├── frame_00001.jpg
-│     		  ├── frame_00002.jpg
-│     		  ├── ...
-│   	  | cam02
-│     		  ├── frame_00001.jpg
-│     		  ├── frame_00002.jpg
-│     		  ├── ...
-│   	  | ...
-```
-After that, you can use the  `multipleviewprogress.sh` we provided to generate related data of poses and pointcloud.You can use it as follows:
+
+The reader extracts `frame_XXXX` from image names and assigns all views from the same frame to the same normalized timestamp.
+
+In the movable camera cluster workspace, datasets are produced by the external script:
+
 ```bash
-bash multipleviewprogress.sh (youe dataset name)
+python movable_camera_cluster/scripts/prepare_4dgs_dataset.py \
+  --unified_dir movable_camera_cluster/scripts/Results/unified_camera_parameters_r3 \
+  --image_dir /data3/isyang/Workspace/gaussian-splatting/data/movable_camera_cluster/unity_test_02 \
+  --image_subdir input \
+  --output_dir movable_camera_cluster/scripts/4dgs_dataset/unity_test_02_r3_10frames \
+  --num_frames 10
 ```
-You need to ensure that the data folder is organized as follows after running multipleviewprogress.sh:
-```
-├── data
-|   | multipleview
-│     | (your dataset name) 
-│   	  | cam01
-|     		  ├── frame_00001.jpg
-│     		  ├── frame_00002.jpg
-│     		  ├── ...
-│   	  | cam02
-│     		  ├── frame_00001.jpg
-│     		  ├── frame_00002.jpg
-│     		  ├── ...
-│   	  | ...
-│   	  | sparse_
-│     		  ├── cameras.bin
-│     		  ├── images.bin
-│     		  ├── ...
-│   	  | points3D_multipleview.ply
-│   	  | poses_bounds_multipleview.npy
-```
-
 
 ## Training
 
-For training synthetic scenes such as `bouncingballs`, run
+Example: MCCGS `r5`-style 10-frame experiment at 14k iterations.
 
-```
-python train.py -s data/dnerf/bouncingballs --port 6017 --expname "dnerf/bouncingballs" --configs arguments/dnerf/bouncingballs.py 
-```
+```bash
+cd /data3/isyang/Workspace/movable_camera_cluster/4DGaussians_mcc
 
-For training dynerf scenes such as `cut_roasted_beef`, run
-```python
-# First, extract the frames of each video.
-python scripts/preprocess_dynerf.py --datadir data/dynerf/cut_roasted_beef
-# Second, generate point clouds from input data.
-bash colmap.sh data/dynerf/cut_roasted_beef llff
-# Third, downsample the point clouds generated in the second step.
-python scripts/downsample_point.py data/dynerf/cut_roasted_beef/colmap/dense/workspace/fused.ply data/dynerf/cut_roasted_beef/points3D_downsample2.ply
-# Finally, train.
-python train.py -s data/dynerf/cut_roasted_beef --port 6017 --expname "dynerf/cut_roasted_beef" --configs arguments/dynerf/cut_roasted_beef.py 
-```
-For training hypernerf scenes such as `virg/broom`: Pregenerated point clouds by COLMAP are provided [here](https://drive.google.com/file/d/1fUHiSgimVjVQZ2OOzTFtz02E9EqCoWr5/view). Just download them and put them in to correspond folder, and you can skip the former two steps. Also, you can run the commands directly.
-
-```python
-# First, computing dense point clouds by COLMAP
-bash colmap.sh data/hypernerf/virg/broom2 hypernerf
-# Second, downsample the point clouds generated in the first step. 
-python scripts/downsample_point.py data/hypernerf/virg/broom2/colmap/dense/workspace/fused.ply data/hypernerf/virg/broom2/points3D_downsample2.ply
-# Finally, train.
-python train.py -s  data/hypernerf/virg/broom2/ --port 6017 --expname "hypernerf/broom2" --configs arguments/hypernerf/broom2.py 
-```
-
-For training multipleviews scenes,you are supposed to build a configuration file named (you dataset name).py under "./arguments/mutipleview",after that,run
-```python
-python train.py -s  data/multipleview/(your dataset name) --port 6017 --expname "multipleview/(your dataset name)" --configs arguments/multipleview/(you dataset name).py 
-```
-
-
-For your custom datasets, install nerfstudio and follow their [COLMAP](https://colmap.github.io/) pipeline. You should install COLMAP at first, then:
-
-```python
-pip install nerfstudio
-# computing camera poses by colmap pipeline
-ns-process-data images --data data/your-data --output-dir data/your-ns-data
-cp -r data/your-ns-data/images data/your-ns-data/colmap/images
-python train.py -s data/your-ns-data/colmap --port 6017 --expname "custom" --configs arguments/hypernerf/default.py 
-```
-You can customize your training config through the config files.
-
-## Checkpoint
-
-Also, you can train your model with checkpoint.
-
-```python
-python train.py -s data/dnerf/bouncingballs --port 6017 --expname "dnerf/bouncingballs" --configs arguments/dnerf/bouncingballs.py --checkpoint_iterations 200 # change it.
-```
-
-Then load checkpoint with:
-
-```python
-python train.py -s data/dnerf/bouncingballs --port 6017 --expname "dnerf/bouncingballs" --configs arguments/dnerf/bouncingballs.py --start_checkpoint "output/dnerf/bouncingballs/chkpnt_coarse_200.pth"
-# finestage: --start_checkpoint "output/dnerf/bouncingballs/chkpnt_fine_200.pth"
+python train.py \
+  -s /data3/isyang/Workspace/movable_camera_cluster/scripts/4dgs_dataset/unity_test_02_r3_10frames \
+  --model_path /data3/isyang/Workspace/movable_camera_cluster/scripts/4dgs_output/unity_test_02_r3_10frames_mcc_motion_r5_iter14000 \
+  --images input \
+  --configs arguments/movable_camera_cluster.py \
+  --pose_refine \
+  --mcc_motion_comp \
+  --iterations 14000 \
+  --save_iterations 14000 \
+  --test_iterations 3000 7000 14000 \
+  --densify_until_iter 10000 \
+  --mcc_motion_loss_weight 0.01 \
+  --mcc_motion_start 8000 \
+  --mcc_motion_end 13000 \
+  --mcc_motion_interval 1000 \
+  --mcc_motion_sample_points 1024 \
+  --mcc_motion_max_propagated_points 64 \
+  --mcc_motion_confidence_threshold 0.35 \
+  --port 6021
 ```
 
 ## Rendering
 
-Run the following script to render the images.
-
-```
-python render.py --model_path "output/dnerf/bouncingballs/"  --skip_train --configs arguments/dnerf/bouncingballs.py 
-```
-
-## Evaluation
-
-You can just run the following script to evaluate the model.
-
-```
-python metrics.py --model_path "output/dnerf/bouncingballs/" 
-```
-
-
-## Viewer
-[Watch me](./docs/viewer_usage.md)
-## Scripts
-
-There are some helpful scripts, please feel free to use them.
-
-`export_perframe_3DGS.py`:
-get all 3D Gaussians point clouds at each timestamps.
-
-usage:
-
-```python
-python export_perframe_3DGS.py --iteration 14000 --configs arguments/dnerf/lego.py --model_path output/dnerf/lego 
-```
-
-You will a set of 3D Gaussians are saved in `output/dnerf/lego/gaussian_pertimestamp`.
-
-`weight_visualization.ipynb`:
-
-visualize the weight of Multi-resolution HexPlane module.
-
-`merge_many_4dgs.py`:
-merge your trained 4dgs.
-usage:
-
-```python
-export exp_name="dynerf"
-python merge_many_4dgs.py --model_path output/$exp_name/sear_steak
-```
-
-`colmap.sh`:
-generate point clouds from input data
-
 ```bash
-bash colmap.sh data/hypernerf/virg/vrig-chicken hypernerf 
-bash colmap.sh data/dynerf/sear_steak llff
+cd /data3/isyang/Workspace/movable_camera_cluster/4DGaussians_mcc
+
+python render.py \
+  --model_path /data3/isyang/Workspace/movable_camera_cluster/scripts/4dgs_output/unity_test_02_r3_10frames_mcc_motion_r5_iter14000 \
+  --source_path /data3/isyang/Workspace/movable_camera_cluster/scripts/4dgs_dataset/unity_test_02_r3_10frames \
+  --images input \
+  --configs arguments/movable_camera_cluster.py \
+  --iteration 14000 \
+  --skip_train \
+  --skip_video
 ```
 
-**Blender** format seems doesn't work. Welcome to raise a pull request to fix it.
+## Notes On The Current Method
 
-`downsample_point.py` :downsample generated point clouds by sfm.
+MCCGS currently treats newly created Gaussians as tentative hypotheses:
 
-```python
-python scripts/downsample_point.py data/dynerf/sear_steak/colmap/dense/workspace/fused.ply data/dynerf/sear_steak/points3D_downsample2.ply
+```text
+posterior score =
+  learned motion confidence
+  * likelihood(residual proxy, uncertainty, low opacity, motion evidence)
 ```
 
-In my paper, I always use `colmap.sh` to generate dense point clouds and downsample it to less than 40000 points.
+High-posterior hypotheses are propagated along estimated Gaussian motion with low initial opacity and a slightly reduced scale. This is still a first approximation. A more principled next step is to explicitly track hypothesis support and reject or accept new Gaussians based on multi-view/time residual reduction.
 
-Here are some codes maybe useful but never adopted in my paper, you can also try it.
+## Acknowledgements
 
-## Awesome Concurrent/Related Works
+This codebase is built on top of:
 
-Welcome to also check out these awesome concurrent/related works, including but not limited to
+- [4DGaussians](https://github.com/hustvl/4DGaussians)
+- [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting)
 
-[Deformable 3D Gaussians for High-Fidelity Monocular Dynamic Scene Reconstruction](https://ingra14m.github.io/Deformable-Gaussians/)
-
-[SC-GS: Sparse-Controlled Gaussian Splatting for Editable Dynamic Scenes](https://yihua7.github.io/SC-GS-web/)
-
-[MD-Splatting: Learning Metric Deformation from 4D Gaussians in Highly Deformable Scenes](https://md-splatting.github.io/)
-
-[4DGen: Grounded 4D Content Generation with Spatial-temporal Consistency](https://vita-group.github.io/4DGen/)
-
-[Diffusion4D: Fast Spatial-temporal Consistent 4D Generation via Video Diffusion Models](https://github.com/VITA-Group/Diffusion4D)
-
-[DreamGaussian4D: Generative 4D Gaussian Splatting](https://github.com/jiawei-ren/dreamgaussian4d)
-
-[EndoGaussian: Real-time Gaussian Splatting for Dynamic Endoscopic Scene Reconstruction](https://github.com/yifliu3/EndoGaussian)
-
-[EndoGS: Deformable Endoscopic Tissues Reconstruction with Gaussian Splatting](https://github.com/HKU-MedAI/EndoGS)
-
-[Endo-4DGS: Endoscopic Monocular Scene Reconstruction with 4D Gaussian Splatting](https://arxiv.org/abs/2401.16416)
-
-
-
-## Contributions
-
-**This project is still under development. Please feel free to raise issues or submit pull requests to contribute to our codebase.**
-
-
-Some source code of ours is borrowed from [3DGS](https://github.com/graphdeco-inria/gaussian-splatting), [K-planes](https://github.com/Giodiro/kplanes_nerfstudio), [HexPlane](https://github.com/Caoang327/HexPlane), [TiNeuVox](https://github.com/hustvl/TiNeuVox), [Depth-Rasterization](https://github.com/ingra14m/depth-diff-gaussian-rasterization). We sincerely appreciate the excellent works of these authors.
-
-## Acknowledgement
-
-We would like to express our sincere gratitude to [@zhouzhenghong-gt](https://github.com/zhouzhenghong-gt/) for his revisions to our code and discussions on the content of our paper.
-
-## Citation
-
-Some insights about neural voxel grids and dynamic scenes reconstruction originate from [TiNeuVox](https://github.com/hustvl/TiNeuVox). If you find this repository/work helpful in your research, welcome to cite these papers and give a ⭐.
-
-```
-@InProceedings{Wu_2024_CVPR,
-    author    = {Wu, Guanjun and Yi, Taoran and Fang, Jiemin and Xie, Lingxi and Zhang, Xiaopeng and Wei, Wei and Liu, Wenyu and Tian, Qi and Wang, Xinggang},
-    title     = {4D Gaussian Splatting for Real-Time Dynamic Scene Rendering},
-    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-    month     = {June},
-    year      = {2024},
-    pages     = {20310-20320}
-}
-
-@inproceedings{TiNeuVox,
-  author = {Fang, Jiemin and Yi, Taoran and Wang, Xinggang and Xie, Lingxi and Zhang, Xiaopeng and Liu, Wenyu and Nie\ss{}ner, Matthias and Tian, Qi},
-  title = {Fast Dynamic Radiance Fields with Time-Aware Neural Voxels},
-  year = {2022},
-  booktitle = {SIGGRAPH Asia 2022 Conference Papers}
-}
-```
+Please cite the original 4DGS and 3DGS papers when using this repository.
