@@ -178,6 +178,19 @@ class OptimizationParams(ParamGroup):
         self.mcc_motion_max_propagated_points=512
         self.mcc_motion_confidence_threshold=0.7
         self.mcc_motion_propagation_scale=1.0
+        self.mcc_verify_hypotheses=False
+        self.mcc_verify_interval=1000
+        self.mcc_verify_min_tests=2
+        self.mcc_verify_accept_threshold=0.0002
+        self.mcc_verify_reject_threshold=-0.0002
+        self.mcc_verify_views=1
+        self.mcc_verify_adaptive=False
+        self.mcc_verify_adaptive_min_abs=0.000002
+        self.mcc_verify_adaptive_mad_scale=1.5
+        self.mcc_verify_sign_ratio=0.65
+        self.mcc_verify_history=16
+        self.mcc_verify_l1_weight=1.0
+        self.mcc_verify_edge_weight=0.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

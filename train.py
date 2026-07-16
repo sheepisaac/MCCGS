@@ -41,6 +41,129 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+
+def _camera_gt_image(viewpoint, dataset_type):
+    if dataset_type == "PanopticSports":
+        return viewpoint["image"].cuda()
+    return viewpoint.original_image.cuda()
+
+
+def _image_gradient_l1(rendered, gt):
+    render_dx = rendered[:, :, 1:] - rendered[:, :, :-1]
+    gt_dx = gt[:, :, 1:] - gt[:, :, :-1]
+    render_dy = rendered[:, 1:, :] - rendered[:, :-1, :]
+    gt_dy = gt[:, 1:, :] - gt[:, :-1, :]
+    return (render_dx - gt_dx).abs().mean() + (render_dy - gt_dy).abs().mean()
+
+
+def _cvte_image_loss(rendered, gt, opt):
+    l1_weight = float(getattr(opt, "mcc_verify_l1_weight", 1.0))
+    edge_weight = float(getattr(opt, "mcc_verify_edge_weight", 0.0))
+    loss = l1_weight * l1_loss(rendered, gt).mean()
+    if edge_weight > 0:
+        loss = loss + edge_weight * _image_gradient_l1(rendered, gt)
+    return loss
+
+
+@torch.no_grad()
+def _verify_probation_hypotheses(
+    gaussians,
+    motion_controller,
+    cameras,
+    iteration,
+    render_func,
+    pipe,
+    background,
+    stage,
+    dataset_type,
+    pose_correction,
+    opt,
+    tb_writer,
+):
+    if not opt.mcc_verify_hypotheses or not motion_controller.has_probation() or not cameras:
+        return
+
+    probation_mask = motion_controller.probation_mask(gaussians.get_xyz.shape[0], gaussians.get_xyz.device)
+    if probation_mask.sum() == 0:
+        motion_controller.clear_probation()
+        return
+
+    verify_views = min(max(int(getattr(opt, "mcc_verify_views", 1)), 1), len(cameras))
+    start_idx = (iteration // max(opt.mcc_verify_interval, 1)) % len(cameras)
+    stride = max(len(cameras) // verify_views, 1)
+    selected_cameras = [cameras[(start_idx + view_idx * stride) % len(cameras)] for view_idx in range(verify_views)]
+
+    full_losses = []
+    for viewpoint in selected_cameras:
+        if pose_correction is not None:
+            pose_correction.apply_to_camera(viewpoint)
+        gt = _camera_gt_image(viewpoint, dataset_type)[:3]
+        full = torch.clamp(
+            render_func(viewpoint, gaussians, pipe, background, stage=stage, cam_type=dataset_type)["render"],
+            0.0,
+            1.0,
+        )
+        full_losses.append(_cvte_image_loss(full, gt, opt))
+
+    saved_opacity = gaussians._opacity.data[probation_mask].clone()
+    gaussians._opacity.data[probation_mask] = -20.0
+    without_losses = []
+    for viewpoint in selected_cameras:
+        gt = _camera_gt_image(viewpoint, dataset_type)[:3]
+        without = torch.clamp(
+            render_func(viewpoint, gaussians, pipe, background, stage=stage, cam_type=dataset_type)["render"],
+            0.0,
+            1.0,
+        )
+        without_losses.append(_cvte_image_loss(without, gt, opt))
+    gaussians._opacity.data[probation_mask] = saved_opacity
+
+    full_loss = torch.stack(full_losses).mean()
+    without_loss = torch.stack(without_losses).mean()
+    delta_loss = float((without_loss - full_loss).detach().cpu())
+    probation_count = int(probation_mask.sum().item())
+    decision, decision_stats = motion_controller.update_probation_evidence(
+        delta_loss,
+        opt.mcc_verify_min_tests,
+        opt.mcc_verify_accept_threshold,
+        opt.mcc_verify_reject_threshold,
+        adaptive=getattr(opt, "mcc_verify_adaptive", False),
+        adaptive_min_abs=getattr(opt, "mcc_verify_adaptive_min_abs", 0.000002),
+        adaptive_mad_scale=getattr(opt, "mcc_verify_adaptive_mad_scale", 1.5),
+        sign_ratio=getattr(opt, "mcc_verify_sign_ratio", 0.65),
+        history_size=getattr(opt, "mcc_verify_history", 16),
+    )
+
+    if tb_writer:
+        tb_writer.add_scalar("fine/mcc_verify_delta_loss", delta_loss, iteration)
+        tb_writer.add_scalar("fine/mcc_verify_evidence_ema", motion_controller.probation_evidence, iteration)
+        tb_writer.add_scalar("fine/mcc_verify_tests", motion_controller.probation_tests, iteration)
+        tb_writer.add_scalar("fine/mcc_verify_probation_points", probation_count, iteration)
+        tb_writer.add_scalar("fine/mcc_verify_views", verify_views, iteration)
+        for key, value in decision_stats.items():
+            tb_writer.add_scalar(f"fine/mcc_verify_{key}", value, iteration)
+
+    print(
+        f"\n[ITER {iteration}] CVTE {decision}: "
+        f"probation={probation_count}, delta={delta_loss:.6f}, "
+        f"evidence_ema={motion_controller.probation_evidence:.6f}, "
+        f"tests={motion_controller.probation_tests}, views={verify_views}, "
+        f"thr=[{decision_stats.get('threshold_neg', opt.mcc_verify_reject_threshold):.6f}, "
+        f"{decision_stats.get('threshold_pos', opt.mcc_verify_accept_threshold):.6f}], "
+        f"pos={decision_stats.get('positive_ratio', 0.0):.2f}"
+    )
+
+    if decision == "accepted":
+        print(f"\n[ITER {iteration}] CVTE accepted probation hypotheses (delta={delta_loss:.6f})")
+    elif decision == "rejected":
+        rejected_points = probation_count
+        gaussians.prune_points(probation_mask)
+        motion_controller.clear_probation()
+        motion_controller._last_cache = None
+        print(f"\n[ITER {iteration}] CVTE rejected and pruned {rejected_points} probation points (delta={delta_loss:.6f})")
+
+
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, stage, tb_writer, train_iter,timer, pose_correction=None, birth_controller=None, motion_controller=None):
@@ -290,6 +413,17 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 viewspace_point_tensor_grad,
                 mean_time,
             )
+            if iteration % max(opt.mcc_motion_interval, 1) == 0:
+                candidate_stats = motion_controller.last_candidate_stats()
+                if candidate_stats:
+                    print(
+                        f"\n[ITER {iteration}] MCC proposal score: "
+                        f"mean={candidate_stats['score_mean']:.4f}, "
+                        f"max={candidate_stats['score_max']:.4f}, "
+                        f"candidates={candidate_stats['candidate_count']} "
+                        f"(thr={candidate_stats['threshold']:.4f}), "
+                        f"probation={candidate_stats['probation_count']}"
+                    )
             if tb_writer:
                 for key, value in completion_stats.items():
                     tb_writer.add_scalar(f"fine/mcc_completion_{key}", value, iteration)
@@ -348,15 +482,6 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                         print(f"\n[ITER {iteration}] Gaussian birth added {born_points} points")
                         if tb_writer:
                             tb_writer.add_scalar("fine/gaussian_birth_points", born_points, iteration)
-                if motion_active \
-                    and iteration % opt.mcc_motion_interval == 0 \
-                    and gaussians.get_xyz.shape[0] < 360000:
-                    propagated_points = motion_controller.propagate(gaussians)
-                    if propagated_points > 0:
-                        print(f"\n[ITER {iteration}] MCC motion propagation added {propagated_points} points")
-                        if tb_writer:
-                            tb_writer.add_scalar("fine/mcc_motion_propagated_points", propagated_points, iteration)
-
                 if stage == "coarse":
                     opacity_threshold = opt.opacity_threshold_coarse
                     densify_threshold = opt.densify_grad_threshold_coarse
@@ -379,8 +504,42 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 if iteration % opt.opacity_reset_interval == 0:
                     print("reset opacity")
                     gaussians.reset_opacity()
-                    
-            
+
+            if motion_this_stage \
+                and opt.mcc_verify_hypotheses \
+                and iteration >= opt.mcc_motion_start \
+                and iteration % opt.mcc_verify_interval == 0:
+                heldout_cameras = test_cams if len(test_cams) > 0 else train_cams
+                _verify_probation_hypotheses(
+                    gaussians,
+                    motion_controller,
+                    heldout_cameras,
+                    iteration,
+                    render,
+                    pipe,
+                    background,
+                    stage,
+                    scene.dataset_type,
+                    pose_correction if refine_pose_this_stage else None,
+                    opt,
+                    tb_writer,
+                )
+
+            if motion_active \
+                and iteration % opt.mcc_motion_interval == 0 \
+                and gaussians.get_xyz.shape[0] < 360000:
+                candidate_stats = motion_controller.last_candidate_stats()
+                propagated_points = motion_controller.propagate(gaussians)
+                if propagated_points > 0:
+                    print(f"\n[ITER {iteration}] MCC motion propagation added {propagated_points} points")
+                    if tb_writer:
+                        tb_writer.add_scalar("fine/mcc_motion_propagated_points", propagated_points, iteration)
+                elif candidate_stats:
+                    print(
+                        f"\n[ITER {iteration}] MCC motion propagation skipped: "
+                        f"candidates={candidate_stats['candidate_count']} "
+                        f"(thr={candidate_stats['threshold']:.4f})"
+                    )
 
             # Optimizer step
             if iteration < opt.iterations:
