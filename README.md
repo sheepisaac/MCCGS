@@ -2,7 +2,7 @@
 
 MCCGS is a research prototype for reconstructing dynamic scenes captured by a **movable camera cluster** into a unified 4D Gaussian representation.
 
-This repository is based on [4DGaussians](https://github.com/hustvl/4DGaussians), with experimental changes for movable multi-camera capture, frame-aware timestamps, pose refinement, and posterior-guided Gaussian completion.
+This repository is based on [4DGaussians](https://github.com/hustvl/4DGaussians), with experimental changes for movable multi-camera capture, frame-aware timestamps, pose refinement, posterior-guided Gaussian completion, and CVTE-based Gaussian hypothesis verification.
 
 > Status: early research code. The implementation is intended for rapid experiments and ablations rather than polished general-purpose use.
 
@@ -29,15 +29,18 @@ MCCGS explores this as a posterior-guided Gaussian hypothesis problem:
 - Frame-level camera pose refinement.
 - Motion-compensated Gaussian propagation.
 - Bayesian-style posterior scoring for conservative Gaussian completion.
+- CVTE-style held-out verification for tentative Gaussian hypotheses.
+- Adaptive and edge-aware CVTE variants for detail-sensitive verification.
 - Render-time loading of learned pose correction.
 - Per-frame 3DGS export utilities for comparison/debugging.
 
-The current best experimental direction is the `r5` setting:
+The current best two-frame smoke-test direction is the `r9` setting:
 
 ```text
 pose refinement
-+ weak motion compensation
-+ posterior-guided conservative Gaussian birth
++ motion-compensated proposal
++ edge-aware CVTE verification
++ posterior-guided conservative Gaussian completion
 ```
 
 ## Repository Layout
@@ -55,7 +58,13 @@ scene/
 utils/
   pose_correction.py               # frame-level pose refinement
   gaussian_birth.py                # earlier MLP-assisted birth prototype
-  motion_compensation.py           # posterior-guided motion/completion controller
+  motion_compensation.py           # posterior-guided motion/CVTE controller
+
+scripts/
+  run_mccgs_r7_2frames.sh          # baseline CVTE smoke test
+  run_mccgs_r8_2frames.sh          # adaptive multi-view CVTE test
+  run_mccgs_r9_2frames.sh          # edge-aware CVTE test
+  render_eval_mccgs_r*_2frames.sh  # render/evaluate two-frame experiments
 
 train.py                           # training loop with MCCGS options
 render.py                          # rendering with optional pose correction
@@ -113,50 +122,27 @@ python movable_camera_cluster/scripts/prepare_4dgs_dataset.py \
 
 ## Training
 
-Example: MCCGS `r5`-style 10-frame experiment at 14k iterations.
+Example: MCCGS `r9` two-frame edge-aware CVTE experiment at 14k iterations.
 
 ```bash
-cd /data3/isyang/Workspace/movable_camera_cluster/4DGaussians_mcc
+cd /data3/isyang/Workspace
+conda activate Gaussians4D
 
-python train.py \
-  -s /data3/isyang/Workspace/movable_camera_cluster/scripts/4dgs_dataset/unity_test_02_r3_10frames \
-  --model_path /data3/isyang/Workspace/movable_camera_cluster/scripts/4dgs_output/unity_test_02_r3_10frames_mcc_motion_r5_iter14000 \
-  --images input \
-  --configs arguments/movable_camera_cluster.py \
-  --pose_refine \
-  --mcc_motion_comp \
-  --iterations 14000 \
-  --save_iterations 14000 \
-  --test_iterations 3000 7000 14000 \
-  --densify_until_iter 10000 \
-  --mcc_motion_loss_weight 0.01 \
-  --mcc_motion_start 8000 \
-  --mcc_motion_end 13000 \
-  --mcc_motion_interval 1000 \
-  --mcc_motion_sample_points 1024 \
-  --mcc_motion_max_propagated_points 64 \
-  --mcc_motion_confidence_threshold 0.35 \
-  --port 6021
+bash movable_camera_cluster/4DGaussians_mcc/scripts/run_mccgs_r9_2frames.sh
 ```
 
 ## Rendering
 
 ```bash
-cd /data3/isyang/Workspace/movable_camera_cluster/4DGaussians_mcc
+cd /data3/isyang/Workspace
+conda activate Gaussians4D
 
-python render.py \
-  --model_path /data3/isyang/Workspace/movable_camera_cluster/scripts/4dgs_output/unity_test_02_r3_10frames_mcc_motion_r5_iter14000 \
-  --source_path /data3/isyang/Workspace/movable_camera_cluster/scripts/4dgs_dataset/unity_test_02_r3_10frames \
-  --images input \
-  --configs arguments/movable_camera_cluster.py \
-  --iteration 14000 \
-  --skip_train \
-  --skip_video
+bash movable_camera_cluster/4DGaussians_mcc/scripts/render_eval_mccgs_r9_2frames.sh
 ```
 
 ## Notes On The Current Method
 
-MCCGS currently treats newly created Gaussians as tentative hypotheses:
+MCCGS treats newly created Gaussians as tentative hypotheses:
 
 ```text
 posterior score =
@@ -164,7 +150,60 @@ posterior score =
   * likelihood(residual proxy, uncertainty, low opacity, motion evidence)
 ```
 
-High-posterior hypotheses are propagated along estimated Gaussian motion with low initial opacity and a slightly reduced scale. This is still a first approximation. A more principled next step is to explicitly track hypothesis support and reject or accept new Gaussians based on multi-view/time residual reduction.
+High-posterior hypotheses are propagated along estimated Gaussian motion with low initial opacity and a slightly reduced scale. CVTE then evaluates these probationary Gaussians by rendering held-out views twice:
+
+```text
+R_full     = render(with probation Gaussians)
+R_without  = render(with probation Gaussians hidden)
+delta      = loss(R_without, GT) - loss(R_full, GT)
+```
+
+Positive delta means the probation hypotheses help the held-out render. Negative delta means they hurt and should be pruned or downweighted.
+
+The current implementation includes three experimental variants:
+
+- `r7`: basic CVTE smoke test with conservative hypothesis verification.
+- `r8`: adaptive multi-view CVTE, using recent delta statistics to estimate a local noise floor instead of relying only on a fixed threshold.
+- `r9`: edge-aware CVTE, adding image-gradient error to the verification loss so high-frequency structures such as building textures, dinosaur surfaces, and tree foliage contribute more strongly to the hypothesis score.
+
+In the first two-frame test split, `r9` improved perceptual quality over `r7` while preserving PSNR:
+
+```text
+r7: PSNR 25.6325, SSIM 0.8993, LPIPS-VGG 0.1345, LPIPS-Alex 0.1276
+r8: PSNR 24.2709, SSIM 0.8983, LPIPS-VGG 0.1351, LPIPS-Alex 0.1298
+r9: PSNR 25.6416, SSIM 0.8991, LPIPS-VGG 0.1325, LPIPS-Alex 0.1253
+```
+
+These numbers are early ablation results, not final benchmark claims. They are useful mainly for comparing MCCGS hypothesis-generation variants under the same two-frame smoke-test setting.
+
+## CVTE Options
+
+The main CVTE-related training flags are:
+
+```text
+--mcc_verify_hypotheses
+--mcc_verify_interval
+--mcc_verify_min_tests
+--mcc_verify_views
+--mcc_verify_accept_threshold
+--mcc_verify_reject_threshold
+--mcc_verify_adaptive
+--mcc_verify_adaptive_min_abs
+--mcc_verify_adaptive_mad_scale
+--mcc_verify_sign_ratio
+--mcc_verify_history
+--mcc_verify_l1_weight
+--mcc_verify_edge_weight
+```
+
+The `r9` script enables edge-aware CVTE with:
+
+```text
+--mcc_verify_views 3
+--mcc_verify_adaptive
+--mcc_verify_l1_weight 1.0
+--mcc_verify_edge_weight 0.25
+```
 
 ## Acknowledgements
 
