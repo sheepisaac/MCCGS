@@ -57,6 +57,15 @@ def _image_gradient_l1(rendered, gt):
     return (render_dx - gt_dx).abs().mean() + (render_dy - gt_dy).abs().mean()
 
 
+def _image_gradient_map(image):
+    gray = image[:3].mean(dim=0, keepdim=True)
+    dx = torch.zeros_like(gray)
+    dy = torch.zeros_like(gray)
+    dx[:, :, 1:] = (gray[:, :, 1:] - gray[:, :, :-1]).abs()
+    dy[:, 1:, :] = (gray[:, 1:, :] - gray[:, :-1, :]).abs()
+    return (dx + dy).squeeze(0)
+
+
 def _cvte_image_loss(rendered, gt, opt):
     l1_weight = float(getattr(opt, "mcc_verify_l1_weight", 1.0))
     edge_weight = float(getattr(opt, "mcc_verify_edge_weight", 0.0))
@@ -64,6 +73,413 @@ def _cvte_image_loss(rendered, gt, opt):
     if edge_weight > 0:
         loss = loss + edge_weight * _image_gradient_l1(rendered, gt)
     return loss
+
+
+def _pixel_l1_map(rendered, gt):
+    return (rendered[:3] - gt[:3]).abs().mean(dim=0)
+
+
+def _local_counterfactual_evidence(full, without, gt, opt, support_mask=None):
+    full_l1 = _pixel_l1_map(full, gt)
+    without_l1 = _pixel_l1_map(without, gt)
+    contribution = (full[:3] - without[:3]).abs().mean(dim=0)
+    residual = full_l1.detach()
+
+    weight = contribution
+    if float(getattr(opt, "mcc_hypothesis_residual_weight", 0.0)) > 0:
+        residual_norm = residual / residual.quantile(0.95).clamp_min(1e-6)
+        weight = weight * (1.0 + float(opt.mcc_hypothesis_residual_weight) * residual_norm.clamp(0.0, 4.0))
+    if float(getattr(opt, "mcc_hypothesis_edge_weight", 0.0)) > 0:
+        edge_residual = (_image_gradient_map(full) - _image_gradient_map(gt)).abs()
+        edge_norm = edge_residual / edge_residual.quantile(0.95).clamp_min(1e-6)
+        weight = weight * (1.0 + float(opt.mcc_hypothesis_edge_weight) * edge_norm.clamp(0.0, 4.0))
+
+    flat_weight = weight.flatten()
+    if flat_weight.numel() == 0 or float(flat_weight.max().detach().cpu()) <= 0.0:
+        return torch.zeros((), device=full.device), {"support": 0.0, "raw_delta": 0.0, "weight_mean": 0.0}
+
+    if support_mask is not None and support_mask.any():
+        support = support_mask.to(device=weight.device, dtype=torch.bool)
+    else:
+        quantile = min(max(float(getattr(opt, "mcc_hypothesis_support_quantile", 0.90)), 0.0), 1.0)
+        threshold = torch.quantile(flat_weight.float(), quantile)
+        support = weight >= threshold
+    min_support = int(getattr(opt, "mcc_hypothesis_support_min", 64))
+    if int(support.sum().item()) < min_support:
+        k = min(max(min_support, 1), flat_weight.numel())
+        _, top_idx = torch.topk(flat_weight, k=k, largest=True)
+        support = torch.zeros_like(flat_weight, dtype=torch.bool)
+        support[top_idx] = True
+        support = support.view_as(weight)
+
+    support_weight = weight[support].clamp_min(1e-8)
+    local_delta_map = without_l1[support] - full_l1[support]
+    weighted_delta = (local_delta_map * support_weight).sum() / support_weight.sum().clamp_min(1e-8)
+    raw_delta = local_delta_map.mean()
+    if bool(getattr(opt, "mcc_hypothesis_normalize", True)):
+        local_full = (full_l1[support] * support_weight).sum() / support_weight.sum().clamp_min(1e-8)
+        weighted_delta = weighted_delta / local_full.detach().clamp_min(1e-4)
+    stats = {
+        "support": float(support.sum().detach().cpu()),
+        "raw_delta": float(raw_delta.detach().cpu()),
+        "weight_mean": float(support_weight.mean().detach().cpu()),
+    }
+    return weighted_delta, stats
+
+
+@torch.no_grad()
+def _deformed_group_xyz(gaussians, group_mask, time_value):
+    indices = torch.nonzero(group_mask, as_tuple=False).squeeze(-1)
+    if indices.numel() == 0:
+        return None
+    max_points = int(getattr(_deformed_group_xyz, "max_points", 128))
+    if indices.numel() > max_points:
+        indices = indices[torch.linspace(0, indices.numel() - 1, steps=max_points, device=indices.device).long()]
+    xyz = gaussians.get_xyz[indices]
+    scales = gaussians._scaling[indices]
+    rotations = gaussians._rotation[indices]
+    opacity = gaussians._opacity[indices]
+    shs = gaussians.get_features[indices]
+    times = torch.full((indices.shape[0], 1), float(time_value), device=xyz.device, dtype=xyz.dtype)
+    means3d, _, _, _, _ = gaussians._deformation(xyz, scales, rotations, opacity, shs, times)
+    return means3d
+
+
+@torch.no_grad()
+def _projection_support_mask(gaussians, group_mask, viewpoint, opt):
+    height = int(viewpoint.image_height)
+    width = int(viewpoint.image_width)
+    if height <= 0 or width <= 0:
+        return None
+
+    _deformed_group_xyz.max_points = int(getattr(opt, "mcc_hypothesis_projection_max_points", 128))
+    xyz = _deformed_group_xyz(gaussians, group_mask, getattr(viewpoint, "time", 0.0))
+    if xyz is None or xyz.numel() == 0:
+        return None
+
+    ones = torch.ones((xyz.shape[0], 1), device=xyz.device, dtype=xyz.dtype)
+    xyz_h = torch.cat([xyz, ones], dim=-1)
+    proj = xyz_h @ viewpoint.full_proj_transform.to(device=xyz.device, dtype=xyz.dtype)
+    w = proj[:, 3].clamp_min(1e-6)
+    ndc = proj[:, :3] / w.unsqueeze(-1)
+    valid = torch.isfinite(ndc).all(dim=-1) & (w > 1e-6)
+    valid = valid & (ndc[:, 0] >= -1.2) & (ndc[:, 0] <= 1.2) & (ndc[:, 1] >= -1.2) & (ndc[:, 1] <= 1.2)
+    if not valid.any():
+        return None
+
+    xs = ((ndc[valid, 0] + 1.0) * 0.5 * (width - 1)).round().long().clamp(0, width - 1)
+    ys = ((1.0 - ndc[valid, 1]) * 0.5 * (height - 1)).round().long().clamp(0, height - 1)
+    radius = max(int(getattr(opt, "mcc_hypothesis_projection_radius", 24)), 1)
+    mask = torch.zeros((height, width), device=xyz.device, dtype=torch.bool)
+    for x, y in zip(xs.tolist(), ys.tolist()):
+        x0 = max(x - radius, 0)
+        x1 = min(x + radius + 1, width)
+        y0 = max(y - radius, 0)
+        y1 = min(y + radius + 1, height)
+        mask[y0:y1, x0:x1] = True
+
+    max_area = float(getattr(opt, "mcc_hypothesis_projection_max_area", 0.25))
+    area = float(mask.float().mean().detach().cpu())
+    if area <= 0.0 or area > max_area:
+        return None
+    return mask
+
+
+@torch.no_grad()
+def _unproject_pixels_to_world(viewpoint, xs, ys, depths):
+    width = float(viewpoint.image_width)
+    height = float(viewpoint.image_height)
+    x_ndc = ((xs.float() + 0.5) / width) * 2.0 - 1.0
+    y_ndc = 1.0 - ((ys.float() + 0.5) / height) * 2.0
+    dirs_cam = torch.stack(
+        [
+            x_ndc * np.tan(float(viewpoint.FoVx) * 0.5),
+            y_ndc * np.tan(float(viewpoint.FoVy) * 0.5),
+            torch.ones_like(x_ndc),
+        ],
+        dim=-1,
+    )
+    view_inv = viewpoint.world_view_transform.to(device=depths.device, dtype=depths.dtype).inverse()
+    dirs_world = torch.nn.functional.normalize(dirs_cam.to(depths.dtype) @ view_inv[:3, :3], dim=-1)
+    center = viewpoint.camera_center.to(device=depths.device, dtype=depths.dtype).unsqueeze(0)
+    return center + dirs_world * depths.unsqueeze(-1)
+
+
+@torch.no_grad()
+def _residual_ray_birth(
+    gaussians,
+    motion_controller,
+    viewpoint_cams,
+    render_pkgs,
+    rendered_images,
+    gt_images,
+    iteration,
+    scene,
+    opt,
+    tb_writer,
+):
+    if not getattr(opt, "mcc_ray_birth", False):
+        return 0
+    if iteration < opt.mcc_ray_start or iteration > opt.mcc_ray_end:
+        return 0
+    if iteration % max(opt.mcc_ray_interval, 1) != 0:
+        return 0
+    if gaussians.get_xyz.shape[0] >= 360000:
+        return 0
+
+    max_points = min(int(opt.mcc_ray_max_points), 360000 - int(gaussians.get_xyz.shape[0]))
+    if max_points <= 0:
+        return 0
+
+    ray_views = min(max(int(opt.mcc_ray_views), 1), len(viewpoint_cams))
+    per_view = max(max_points // ray_views, 1)
+    born_total = 0
+    selected_total = 0
+    score_max = 0.0
+
+    for view_idx in range(ray_views):
+        viewpoint = viewpoint_cams[view_idx]
+        render_pkg = render_pkgs[view_idx]
+        rendered = torch.clamp(rendered_images[view_idx].detach(), 0.0, 1.0)
+        gt = gt_images[view_idx].detach()
+        if rendered.dim() == 4:
+            rendered = rendered.squeeze(0)
+        if gt.dim() == 4:
+            gt = gt.squeeze(0)
+        gt = gt[:3]
+        depth = render_pkg.get("depth", None)
+        if depth is None:
+            continue
+        depth = depth.detach()
+        if depth.dim() == 3:
+            depth = depth.squeeze(0)
+
+        residual = (rendered[:3] - gt).abs().mean(dim=0)
+        if float(getattr(opt, "mcc_ray_edge_weight", 0.0)) > 0:
+            edge_residual = (_image_gradient_map(rendered) - _image_gradient_map(gt)).abs()
+            residual = residual + float(opt.mcc_ray_edge_weight) * edge_residual
+
+        valid_depth = torch.isfinite(depth)
+        valid_depth = valid_depth & (depth > float(opt.mcc_ray_depth_min)) & (depth < float(opt.mcc_ray_depth_max))
+        if not valid_depth.any():
+            continue
+
+        scores = residual[valid_depth]
+        if scores.numel() == 0:
+            continue
+        threshold = max(
+            float(opt.mcc_ray_residual_threshold),
+            float(torch.quantile(scores.float(), min(max(float(opt.mcc_ray_quantile), 0.0), 1.0)).cpu()),
+        )
+        mask = valid_depth & (residual >= threshold)
+        candidate_count = int(mask.sum().item())
+        if candidate_count == 0:
+            continue
+
+        candidate_scores = residual[mask]
+        limit = min(per_view, candidate_count, max_points - born_total)
+        if limit <= 0:
+            break
+        _, order = torch.topk(candidate_scores, k=limit, largest=True)
+        coords = torch.nonzero(mask, as_tuple=False)[order]
+        ys, xs = coords[:, 0], coords[:, 1]
+        selected_depth = depth[ys, xs]
+        if float(opt.mcc_ray_depth_jitter) > 0:
+            selected_depth = selected_depth * (
+                1.0 + torch.randn_like(selected_depth) * float(opt.mcc_ray_depth_jitter)
+            )
+        new_xyz = _unproject_pixels_to_world(viewpoint, xs, ys, selected_depth)
+
+        visible = render_pkg["visibility_filter"].detach()
+        parent_pool = torch.nonzero(visible, as_tuple=False).squeeze(-1)
+        if parent_pool.numel() == 0:
+            parent_pool = torch.arange(gaussians.get_xyz.shape[0], device=gaussians.get_xyz.device)
+        if parent_pool.numel() > 8192:
+            parent_pool = parent_pool[torch.randperm(parent_pool.numel(), device=parent_pool.device)[:8192]]
+        parent_xyz = gaussians.get_xyz[parent_pool].detach()
+        nearest = torch.cdist(new_xyz.detach(), parent_xyz).argmin(dim=1)
+        parent_indices = parent_pool[nearest]
+
+        start_index = gaussians.get_xyz.shape[0]
+        group_id = motion_controller.new_hypothesis_group(
+            "ray",
+            birth_time=getattr(viewpoint, "time", 0.0),
+        ) if getattr(opt, "mcc_hypothesis_gate", False) else 0
+        born = gaussians.birth_from_external_points(
+            new_xyz,
+            parent_indices,
+            opacity_scale=float(opt.mcc_ray_opacity_scale),
+            scale_shrink=float(opt.mcc_ray_scale_shrink),
+            hypothesis_group_id=group_id,
+            existence_prob=float(getattr(opt, "mcc_hypothesis_initial_prob", 0.999))
+            if getattr(opt, "mcc_hypothesis_gate", False)
+            else 0.999,
+        )
+        if born > 0:
+            motion_controller.register_probation(start_index, born, group_id=group_id if group_id > 0 else None)
+            born_total += born
+            selected_total += limit
+            score_max = max(score_max, float(candidate_scores[order[:limit]].max().cpu()))
+
+    if born_total > 0:
+        print(
+            f"\n[ITER {iteration}] MCC residual-ray birth added {born_total} points "
+            f"(selected_pixels={selected_total}, max_score={score_max:.4f})"
+        )
+        if tb_writer:
+            tb_writer.add_scalar("fine/mcc_ray_birth_points", born_total, iteration)
+            tb_writer.add_scalar("fine/mcc_ray_birth_selected_pixels", selected_total, iteration)
+            tb_writer.add_scalar("fine/mcc_ray_birth_score_max", score_max, iteration)
+    return born_total
+
+
+@torch.no_grad()
+def _verify_hypothesis_groups(
+    gaussians,
+    motion_controller,
+    cameras,
+    iteration,
+    render_func,
+    pipe,
+    background,
+    stage,
+    dataset_type,
+    pose_correction,
+    opt,
+    tb_writer,
+):
+    group_ids = motion_controller.active_hypothesis_group_ids(
+        gaussians,
+        max_groups=getattr(opt, "mcc_hypothesis_max_groups_per_verify", 4),
+    )
+    if not group_ids:
+        return False
+
+    verify_views = min(max(int(getattr(opt, "mcc_verify_views", 1)), 1), len(cameras))
+    start_idx = (iteration // max(opt.mcc_verify_interval, 1)) % len(cameras)
+    stride = max(len(cameras) // verify_views, 1)
+    selected_cameras = [cameras[(start_idx + view_idx * stride) % len(cameras)] for view_idx in range(verify_views)]
+
+    full_losses = []
+    full_renders = []
+    full_gts = []
+    for viewpoint in selected_cameras:
+        if pose_correction is not None:
+            pose_correction.apply_to_camera(viewpoint)
+        gt = _camera_gt_image(viewpoint, dataset_type)[:3]
+        full = torch.clamp(
+            render_func(viewpoint, gaussians, pipe, background, stage=stage, cam_type=dataset_type)["render"],
+            0.0,
+            1.0,
+        )
+        full_losses.append(_cvte_image_loss(full, gt, opt))
+        full_renders.append(full)
+        full_gts.append(gt)
+    full_loss = torch.stack(full_losses).mean()
+
+    prune_mask = torch.zeros(gaussians.get_xyz.shape[0], device=gaussians.get_xyz.device, dtype=torch.bool)
+    for group_id in group_ids:
+        group_info = motion_controller.hypothesis_groups.get(int(group_id), {})
+        birth_time = group_info.get("birth_time", None)
+        group_mask = motion_controller.group_mask(gaussians, group_id)
+        if group_mask.sum() == 0:
+            continue
+        saved_logit = gaussians._existence_logit[group_mask].clone()
+        gaussians._existence_logit[group_mask] = -20.0
+        without_losses = []
+        local_evidence = []
+        local_support = []
+        local_raw = []
+        backtrack_evidence = []
+        for view_idx, viewpoint in enumerate(selected_cameras):
+            gt = full_gts[view_idx]
+            without = torch.clamp(
+                render_func(viewpoint, gaussians, pipe, background, stage=stage, cam_type=dataset_type)["render"],
+                0.0,
+                1.0,
+            )
+            without_losses.append(_cvte_image_loss(without, gt, opt))
+            if getattr(opt, "mcc_hypothesis_local_evidence", False):
+                support_mask = None
+                if getattr(opt, "mcc_hypothesis_support_mode", "counterfactual") == "projection":
+                    support_mask = _projection_support_mask(gaussians, group_mask, viewpoint, opt)
+                evidence, evidence_stats = _local_counterfactual_evidence(
+                    full_renders[view_idx],
+                    without,
+                    gt,
+                    opt,
+                    support_mask=support_mask,
+                )
+                local_evidence.append(evidence)
+                local_support.append(evidence_stats["support"])
+                local_raw.append(evidence_stats["raw_delta"])
+                if getattr(opt, "mcc_hypothesis_backtrack", False) and birth_time is not None:
+                    view_time = float(getattr(viewpoint, "time", 0.0))
+                    window = float(getattr(opt, "mcc_hypothesis_backtrack_window", 1.0))
+                    if view_time <= float(birth_time) + 1e-6 and abs(view_time - float(birth_time)) <= window:
+                        backtrack_evidence.append(evidence)
+        gaussians._existence_logit[group_mask] = saved_logit
+
+        without_loss = torch.stack(without_losses).mean()
+        global_delta = float((without_loss - full_loss).detach().cpu())
+        if local_evidence:
+            local_delta_tensor = torch.stack(local_evidence).mean()
+            delta_tensor = local_delta_tensor
+            backtrack_delta = 0.0
+            inconsistency = 0.0
+            if getattr(opt, "mcc_hypothesis_backtrack", False) and backtrack_evidence:
+                back_tensor = torch.stack(backtrack_evidence).mean()
+                inconsistency_tensor = torch.clamp(-torch.stack(backtrack_evidence), min=0.0).mean()
+                delta_tensor = (
+                    delta_tensor
+                    + float(getattr(opt, "mcc_hypothesis_backtrack_weight", 0.5)) * back_tensor
+                    - float(getattr(opt, "mcc_hypothesis_backtrack_negative_weight", 0.25)) * inconsistency_tensor
+                )
+                backtrack_delta = float(back_tensor.detach().cpu())
+                inconsistency = float(inconsistency_tensor.detach().cpu())
+            delta_loss = float(delta_tensor.detach().cpu())
+            support_mean = sum(local_support) / max(len(local_support), 1)
+            raw_local_delta = sum(local_raw) / max(len(local_raw), 1)
+        else:
+            delta_loss = global_delta
+            support_mean = 0.0
+            raw_local_delta = global_delta
+            backtrack_delta = 0.0
+            inconsistency = 0.0
+        decision, stats = motion_controller.update_hypothesis_group(
+            gaussians,
+            group_id,
+            delta_loss,
+            hypothesis_lr=getattr(opt, "mcc_hypothesis_lr", 50.0),
+            mature_prob=getattr(opt, "mcc_hypothesis_mature_prob", 0.7),
+            prune_prob=getattr(opt, "mcc_hypothesis_prune_prob", 0.03),
+        )
+        if decision == "rejected":
+            prune_mask = prune_mask | group_mask
+        if tb_writer:
+            tb_writer.add_scalar(f"fine/mcc_hypothesis_group_{group_id}_delta", delta_loss, iteration)
+            tb_writer.add_scalar(f"fine/mcc_hypothesis_group_{group_id}_global_delta", global_delta, iteration)
+            tb_writer.add_scalar(f"fine/mcc_hypothesis_group_{group_id}_support", support_mean, iteration)
+            tb_writer.add_scalar(f"fine/mcc_hypothesis_group_{group_id}_backtrack", backtrack_delta, iteration)
+            tb_writer.add_scalar(f"fine/mcc_hypothesis_group_{group_id}_inconsistency", inconsistency, iteration)
+            tb_writer.add_scalar(f"fine/mcc_hypothesis_group_{group_id}_prob", stats.get("prob", 0.0), iteration)
+        print(
+            f"\n[ITER {iteration}] CVTE group {decision}: "
+            f"group={group_id}, source={stats.get('source', 'unknown')}, "
+            f"count={stats.get('count', 0)}, delta={delta_loss:.6f}, "
+            f"global={global_delta:.6f}, local_raw={raw_local_delta:.6f}, "
+            f"back={backtrack_delta:.6f}, incons={inconsistency:.6f}, support={support_mean:.0f}, "
+            f"prob={stats.get('prob', 0.0):.4f}, tests={stats.get('tests', 0)}"
+        )
+
+    rejected_points = int(prune_mask.sum().item())
+    if rejected_points > 0:
+        gaussians.prune_points(prune_mask)
+        motion_controller._last_cache = None
+        print(f"\n[ITER {iteration}] CVTE pruned {rejected_points} rejected hypothesis points")
+    active = torch.nonzero(gaussians._hypothesis_state == 1, as_tuple=False).squeeze(-1)
+    motion_controller.probation_indices = active if active.numel() > 0 else None
+    return True
 
 
 @torch.no_grad()
@@ -83,6 +499,24 @@ def _verify_probation_hypotheses(
 ):
     if not opt.mcc_verify_hypotheses or not motion_controller.has_probation() or not cameras:
         return
+
+    if getattr(opt, "mcc_hypothesis_gate", False):
+        handled = _verify_hypothesis_groups(
+            gaussians,
+            motion_controller,
+            cameras,
+            iteration,
+            render_func,
+            pipe,
+            background,
+            stage,
+            dataset_type,
+            pose_correction,
+            opt,
+            tb_writer,
+        )
+        if handled:
+            return
 
     probation_mask = motion_controller.probation_mask(gaussians.get_xyz.shape[0], gaussians.get_xyz.device)
     if probation_mask.sum() == 0:
@@ -225,7 +659,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         print(
             f"MCC motion compensation enabled: interval={opt.mcc_motion_interval}, "
             f"active iters=[{opt.mcc_motion_start}, {opt.mcc_motion_end}], "
-            f"sample_points={opt.mcc_motion_sample_points}"
+            f"sample_points={opt.mcc_motion_sample_points}, "
+            f"birth_opacity={opt.mcc_birth_opacity_scale}, "
+            f"birth_scale={opt.mcc_birth_scale_shrink}"
         )
 
 
@@ -342,6 +778,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             pipe.debug = True
         images = []
         gt_images = []
+        render_pkgs = []
         radii_list = []
         visibility_filter_list = []
         viewspace_point_tensor_list = []
@@ -350,6 +787,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 pose_correction.apply_to_camera(viewpoint_cam)
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            render_pkgs.append(render_pkg)
             images.append(image.unsqueeze(0))
             if scene.dataset_type!="PanopticSports":
                 gt_image = viewpoint_cam.original_image.cuda()
@@ -422,6 +860,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                         f"max={candidate_stats['score_max']:.4f}, "
                         f"candidates={candidate_stats['candidate_count']} "
                         f"(thr={candidate_stats['threshold']:.4f}), "
+                        f"selected={candidate_stats['selected_count']} "
+                        f"(topk={candidate_stats['target_topk']}), "
+                        f"nms_alpha={candidate_stats['nms_alpha']:.2f}, "
                         f"probation={candidate_stats['probation_count']}"
                     )
             if tb_writer:
@@ -529,17 +970,46 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 and iteration % opt.mcc_motion_interval == 0 \
                 and gaussians.get_xyz.shape[0] < 360000:
                 candidate_stats = motion_controller.last_candidate_stats()
-                propagated_points = motion_controller.propagate(gaussians)
+                mean_time = sum(float(getattr(cam, "time", 0.0)) for cam in viewpoint_cams) / max(len(viewpoint_cams), 1)
+                propagated_points = motion_controller.propagate(gaussians, time_value=mean_time)
                 if propagated_points > 0:
-                    print(f"\n[ITER {iteration}] MCC motion propagation added {propagated_points} points")
+                    selection_stats = motion_controller.last_selection_stats()
+                    if selection_stats:
+                        print(
+                            f"\n[ITER {iteration}] MCC motion propagation added {propagated_points} points "
+                            f"(gated={selection_stats.get('gated_count', 0)}, "
+                            f"selected={selection_stats.get('selected_count', 0)}, "
+                            f"after_nms={selection_stats.get('nms_count', propagated_points)})"
+                        )
+                    else:
+                        print(f"\n[ITER {iteration}] MCC motion propagation added {propagated_points} points")
                     if tb_writer:
                         tb_writer.add_scalar("fine/mcc_motion_propagated_points", propagated_points, iteration)
                 elif candidate_stats:
                     print(
                         f"\n[ITER {iteration}] MCC motion propagation skipped: "
                         f"candidates={candidate_stats['candidate_count']} "
-                        f"(thr={candidate_stats['threshold']:.4f})"
+                        f"(thr={candidate_stats['threshold']:.4f}), "
+                        f"selected={candidate_stats['selected_count']}"
                     )
+
+            if motion_active \
+                and getattr(opt, "mcc_ray_birth", False) \
+                and gaussians.get_xyz.shape[0] < 360000:
+                ray_birth_points = _residual_ray_birth(
+                    gaussians,
+                    motion_controller,
+                    viewpoint_cams,
+                    render_pkgs,
+                    images,
+                    gt_images,
+                    iteration,
+                    scene,
+                    opt,
+                    tb_writer,
+                )
+                if tb_writer and ray_birth_points > 0:
+                    tb_writer.add_scalar("fine/mcc_ray_birth_total_points", ray_birth_points, iteration)
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -613,6 +1083,13 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
             max_propagated_points=opt.mcc_motion_max_propagated_points,
             confidence_threshold=opt.mcc_motion_confidence_threshold,
             propagation_scale=opt.mcc_motion_propagation_scale,
+            proposal_topk=opt.mcc_proposal_topk,
+            proposal_quantile=opt.mcc_proposal_quantile,
+            proposal_min_score=opt.mcc_proposal_min_score,
+            proposal_nms_alpha=opt.mcc_proposal_nms_alpha,
+            birth_opacity_scale=opt.mcc_birth_opacity_scale,
+            birth_scale_shrink=opt.mcc_birth_scale_shrink,
+            hypothesis_initial_prob=opt.mcc_hypothesis_initial_prob if opt.mcc_hypothesis_gate else 0.999,
         )
     timer.start()
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,

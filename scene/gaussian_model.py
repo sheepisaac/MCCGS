@@ -54,6 +54,9 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._existence_logit = torch.empty(0)
+        self._hypothesis_group_id = torch.empty(0, dtype=torch.long)
+        self._hypothesis_state = torch.empty(0, dtype=torch.long)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -75,6 +78,9 @@ class GaussianModel:
             self._scaling,
             self._rotation,
             self._opacity,
+            self._existence_logit,
+            self._hypothesis_group_id,
+            self._hypothesis_state,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -94,6 +100,9 @@ class GaussianModel:
         self._scaling, 
         self._rotation, 
         self._opacity,
+        self._existence_logit,
+        self._hypothesis_group_id,
+        self._hypothesis_state,
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
@@ -126,6 +135,12 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    @property
+    def get_existence_gate(self):
+        if self._existence_logit.numel() != self._xyz.shape[0]:
+            return torch.ones((self._xyz.shape[0], 1), device=self._xyz.device, dtype=self._xyz.dtype)
+        return torch.sigmoid(self._existence_logit)
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -160,6 +175,11 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._existence_logit = inverse_sigmoid(
+            torch.full((self.get_xyz.shape[0], 1), 0.999, dtype=torch.float, device="cuda")
+        )
+        self._hypothesis_group_id = torch.zeros((self.get_xyz.shape[0]), dtype=torch.long, device="cuda")
+        self._hypothesis_state = torch.zeros((self.get_xyz.shape[0]), dtype=torch.long, device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
     def training_setup(self, training_args):
@@ -223,6 +243,9 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        l.append('existence_logit')
+        l.append('hypothesis_group_id')
+        l.append('hypothesis_state')
         return l
     def compute_deformation(self,time):
         
@@ -257,11 +280,18 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        self._ensure_hypothesis_tensors()
+        existence_logit = self._existence_logit.detach().cpu().numpy()
+        hypothesis_group_id = self._hypothesis_group_id.detach().float().unsqueeze(-1).cpu().numpy()
+        hypothesis_state = self._hypothesis_state.detach().float().unsqueeze(-1).cpu().numpy()
         
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate(
+            (xyz, normals, f_dc, f_rest, opacities, scale, rotation, existence_logit, hypothesis_group_id, hypothesis_state),
+            axis=1,
+        )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -311,6 +341,24 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        names = [p.name for p in plydata.elements[0].properties]
+        if "existence_logit" in names:
+            existence_logit = np.asarray(plydata.elements[0]["existence_logit"])[..., np.newaxis]
+        else:
+            existence_logit = inverse_sigmoid(
+                torch.full((xyz.shape[0], 1), 0.999, dtype=torch.float, device="cuda")
+            ).detach().cpu().numpy()
+        if "hypothesis_group_id" in names:
+            hypothesis_group_id = np.asarray(plydata.elements[0]["hypothesis_group_id"]).astype(np.int64)
+        else:
+            hypothesis_group_id = np.zeros((xyz.shape[0]), dtype=np.int64)
+        if "hypothesis_state" in names:
+            hypothesis_state = np.asarray(plydata.elements[0]["hypothesis_state"]).astype(np.int64)
+        else:
+            hypothesis_state = np.zeros((xyz.shape[0]), dtype=np.int64)
+        self._existence_logit = torch.tensor(existence_logit, dtype=torch.float, device="cuda")
+        self._hypothesis_group_id = torch.tensor(hypothesis_group_id, dtype=torch.long, device="cuda")
+        self._hypothesis_state = torch.tensor(hypothesis_state, dtype=torch.long, device="cuda")
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -358,6 +406,9 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._existence_logit = self._existence_logit[valid_points_mask]
+        self._hypothesis_group_id = self._hypothesis_group_id[valid_points_mask]
+        self._hypothesis_state = self._hypothesis_state[valid_points_mask]
         self._deformation_accum = self._deformation_accum[valid_points_mask]
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self._deformation_table = self._deformation_table[valid_points_mask]
@@ -387,7 +438,32 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table):
+    def _ensure_hypothesis_tensors(self):
+        n = self._xyz.shape[0]
+        device = self._xyz.device
+        if self._existence_logit.numel() != n:
+            self._existence_logit = inverse_sigmoid(
+                torch.full((n, 1), 0.999, dtype=torch.float, device=device)
+            )
+        if self._hypothesis_group_id.numel() != n:
+            self._hypothesis_group_id = torch.zeros((n), dtype=torch.long, device=device)
+        if self._hypothesis_state.numel() != n:
+            self._hypothesis_state = torch.zeros((n), dtype=torch.long, device=device)
+
+    def densification_postfix(
+        self,
+        new_xyz,
+        new_features_dc,
+        new_features_rest,
+        new_opacities,
+        new_scaling,
+        new_rotation,
+        new_deformation_table,
+        new_existence_logit=None,
+        new_hypothesis_group_id=None,
+        new_hypothesis_state=None,
+    ):
+        self._ensure_hypothesis_tensors()
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -406,6 +482,18 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         # self._deformation = optimizable_tensors["deformation"]
         
+        n_new = new_xyz.shape[0]
+        if new_existence_logit is None:
+            new_existence_logit = inverse_sigmoid(
+                torch.full((n_new, 1), 0.999, dtype=torch.float, device=self._xyz.device)
+            )
+        if new_hypothesis_group_id is None:
+            new_hypothesis_group_id = torch.zeros((n_new), dtype=torch.long, device=self._xyz.device)
+        if new_hypothesis_state is None:
+            new_hypothesis_state = torch.zeros((n_new), dtype=torch.long, device=self._xyz.device)
+        self._existence_logit = torch.cat([self._existence_logit, new_existence_logit.detach().to(self._xyz.device)], dim=0)
+        self._hypothesis_group_id = torch.cat([self._hypothesis_group_id, new_hypothesis_group_id.detach().long().to(self._xyz.device)], dim=0)
+        self._hypothesis_state = torch.cat([self._hypothesis_state, new_hypothesis_state.detach().long().to(self._xyz.device)], dim=0)
         self._deformation_table = torch.cat([self._deformation_table,new_deformation_table],-1)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
@@ -435,7 +523,22 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_deformation_table = self._deformation_table[selected_pts_mask].repeat(N)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_deformation_table)
+        self._ensure_hypothesis_tensors()
+        new_existence_logit = self._existence_logit[selected_pts_mask].repeat(N, 1)
+        new_hypothesis_group_id = self._hypothesis_group_id[selected_pts_mask].repeat(N)
+        new_hypothesis_state = self._hypothesis_state[selected_pts_mask].repeat(N)
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_deformation_table,
+            new_existence_logit,
+            new_hypothesis_group_id,
+            new_hypothesis_state,
+        )
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -453,7 +556,22 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_deformation_table = self._deformation_table[selected_pts_mask]
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
+        self._ensure_hypothesis_tensors()
+        new_existence_logit = self._existence_logit[selected_pts_mask]
+        new_hypothesis_group_id = self._hypothesis_group_id[selected_pts_mask]
+        new_hypothesis_state = self._hypothesis_state[selected_pts_mask]
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_deformation_table,
+            new_existence_logit,
+            new_hypothesis_group_id,
+            new_hypothesis_state,
+        )
 
     @property
     def get_aabb(self):
@@ -486,7 +604,15 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
         return selected_xyz, new_xyz
 
-    def birth_from_existing(self, selected_indices, offsets, opacity_scale=0.5, scale_shrink=0.8):
+    def birth_from_existing(
+        self,
+        selected_indices,
+        offsets,
+        opacity_scale=0.5,
+        scale_shrink=0.8,
+        hypothesis_group_id=0,
+        existence_prob=0.999,
+    ):
         if selected_indices.numel() == 0:
             return 0
         selected_indices = selected_indices.long()
@@ -502,6 +628,21 @@ class GaussianModel:
         new_scaling = self._scaling[selected_indices].detach() + np.log(scale_shrink)
         new_rotation = self._rotation[selected_indices].detach()
         new_deformation_table = torch.ones(selected_indices.shape[0], device=self._xyz.device, dtype=torch.bool)
+        new_existence_logit = inverse_sigmoid(
+            torch.full(
+                (selected_indices.shape[0], 1),
+                float(existence_prob),
+                device=self._xyz.device,
+                dtype=self._xyz.dtype,
+            ).clamp(1e-4, 0.999)
+        )
+        new_hypothesis_group_id = torch.full(
+            (selected_indices.shape[0],),
+            int(hypothesis_group_id),
+            device=self._xyz.device,
+            dtype=torch.long,
+        )
+        new_hypothesis_state = torch.ones((selected_indices.shape[0],), device=self._xyz.device, dtype=torch.long)
 
         self.densification_postfix(
             new_xyz,
@@ -511,8 +652,64 @@ class GaussianModel:
             new_scaling,
             new_rotation,
             new_deformation_table,
+            new_existence_logit,
+            new_hypothesis_group_id,
+            new_hypothesis_state,
         )
         return int(selected_indices.shape[0])
+
+    def birth_from_external_points(
+        self,
+        new_xyz,
+        parent_indices,
+        opacity_scale=0.2,
+        scale_shrink=0.8,
+        hypothesis_group_id=0,
+        existence_prob=0.999,
+    ):
+        if new_xyz.numel() == 0 or parent_indices.numel() == 0:
+            return 0
+        parent_indices = parent_indices.long()
+        new_xyz = new_xyz.to(self._xyz.device, dtype=self._xyz.dtype).detach()
+
+        new_features_dc = self._features_dc[parent_indices].detach()
+        new_features_rest = self._features_rest[parent_indices].detach()
+        new_opacities = self._opacity[parent_indices].detach()
+        new_opacities = self.inverse_opacity_activation(
+            torch.clamp(self.opacity_activation(new_opacities) * opacity_scale, min=1e-4, max=0.95)
+        )
+        new_scaling = self._scaling[parent_indices].detach() + np.log(scale_shrink)
+        new_rotation = self._rotation[parent_indices].detach()
+        new_deformation_table = torch.ones(parent_indices.shape[0], device=self._xyz.device, dtype=torch.bool)
+        new_existence_logit = inverse_sigmoid(
+            torch.full(
+                (parent_indices.shape[0], 1),
+                float(existence_prob),
+                device=self._xyz.device,
+                dtype=self._xyz.dtype,
+            ).clamp(1e-4, 0.999)
+        )
+        new_hypothesis_group_id = torch.full(
+            (parent_indices.shape[0],),
+            int(hypothesis_group_id),
+            device=self._xyz.device,
+            dtype=torch.long,
+        )
+        new_hypothesis_state = torch.ones((parent_indices.shape[0],), device=self._xyz.device, dtype=torch.long)
+
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_deformation_table,
+            new_existence_logit,
+            new_hypothesis_group_id,
+            new_hypothesis_state,
+        )
+        return int(parent_indices.shape[0])
 
     def prune(self, max_grad, min_opacity, extent, max_screen_size):
         prune_mask = (self.get_opacity < min_opacity).squeeze()

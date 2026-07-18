@@ -46,6 +46,13 @@ class MotionCompensationController:
         max_propagated_points=1024,
         confidence_threshold=0.65,
         propagation_scale=1.0,
+        proposal_topk=0,
+        proposal_quantile=1.0,
+        proposal_min_score=-1.0,
+        proposal_nms_alpha=0.0,
+        birth_opacity_scale=0.35,
+        birth_scale_shrink=0.9,
+        hypothesis_initial_prob=0.999,
     ):
         self.model = MotionCompensationMLP(hidden_dim=hidden_dim).cuda()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
@@ -59,11 +66,32 @@ class MotionCompensationController:
         self.max_propagated_points = max_propagated_points
         self.confidence_threshold = confidence_threshold
         self.propagation_scale = propagation_scale
+        self.proposal_topk = int(proposal_topk)
+        self.proposal_quantile = float(proposal_quantile)
+        self.proposal_min_score = float(proposal_min_score)
+        self.proposal_nms_alpha = float(proposal_nms_alpha)
+        self.birth_opacity_scale = float(birth_opacity_scale)
+        self.birth_scale_shrink = float(birth_scale_shrink)
+        self.hypothesis_initial_prob = float(hypothesis_initial_prob)
         self._last_cache = None
         self.probation_indices = None
         self.probation_evidence = 0.0
         self.probation_tests = 0
         self.probation_delta_history = []
+        self.next_group_id = 1
+        self.hypothesis_groups = {}
+
+    def new_hypothesis_group(self, source="motion", birth_time=None):
+        group_id = self.next_group_id
+        self.next_group_id += 1
+        self.hypothesis_groups[group_id] = {
+            "source": source,
+            "birth_time": None if birth_time is None else float(birth_time),
+            "evidence": 0.0,
+            "tests": 0,
+            "mature": False,
+        }
+        return group_id
 
     def zero_grad(self):
         self.optimizer.zero_grad(set_to_none=True)
@@ -83,11 +111,19 @@ class MotionCompensationController:
             mask[valid] = True
         return mask
 
-    def register_probation(self, start_index, count):
+    def register_probation(self, start_index, count, group_id=None):
         if count <= 0:
             return
         device = self.probation_indices.device if self.probation_indices is not None else "cuda"
         new_indices = torch.arange(start_index, start_index + count, device=device, dtype=torch.long)
+        if group_id is not None and int(group_id) not in self.hypothesis_groups:
+            self.hypothesis_groups[int(group_id)] = {
+                "source": "external",
+                "birth_time": None,
+                "evidence": 0.0,
+                "tests": 0,
+                "mature": False,
+            }
         if self.probation_indices is None or self.probation_indices.numel() == 0:
             self.probation_indices = new_indices
             self.probation_evidence = 0.0
@@ -95,6 +131,64 @@ class MotionCompensationController:
             self.probation_delta_history = []
         else:
             self.probation_indices = torch.cat([self.probation_indices, new_indices], dim=0)
+
+    def active_hypothesis_group_ids(self, gaussians, max_groups=4):
+        if not self.hypothesis_groups or gaussians._hypothesis_group_id.numel() != gaussians.get_xyz.shape[0]:
+            return []
+        probation = gaussians._hypothesis_state == 1
+        group_ids = torch.unique(gaussians._hypothesis_group_id[probation]).detach().cpu().tolist()
+        group_ids = [int(group_id) for group_id in group_ids if int(group_id) > 0]
+        group_ids.sort(key=lambda group_id: self.hypothesis_groups.get(group_id, {}).get("tests", 0))
+        return group_ids[:max(int(max_groups), 1)]
+
+    def group_mask(self, gaussians, group_id):
+        return (gaussians._hypothesis_state == 1) & (gaussians._hypothesis_group_id == int(group_id))
+
+    def update_hypothesis_group(
+        self,
+        gaussians,
+        group_id,
+        delta_loss,
+        hypothesis_lr=50.0,
+        mature_prob=0.7,
+        prune_prob=0.03,
+    ):
+        group_id = int(group_id)
+        group = self.hypothesis_groups.setdefault(
+            group_id,
+            {"source": "unknown", "birth_time": None, "evidence": 0.0, "tests": 0, "mature": False},
+        )
+        group["evidence"] = 0.8 * float(group.get("evidence", 0.0)) + 0.2 * float(delta_loss)
+        group["tests"] = int(group.get("tests", 0)) + 1
+
+        mask = self.group_mask(gaussians, group_id)
+        if mask.sum() == 0:
+            self.hypothesis_groups.pop(group_id, None)
+            return "empty", {}
+
+        step = float(hypothesis_lr) * float(delta_loss)
+        gaussians._existence_logit[mask] = (gaussians._existence_logit[mask] + step).clamp(-12.0, 8.0)
+        prob = torch.sigmoid(gaussians._existence_logit[mask]).mean()
+        mean_prob = float(prob.detach().cpu())
+        decision = "testing"
+        if mean_prob >= float(mature_prob):
+            gaussians._hypothesis_state[mask] = 0
+            group["mature"] = True
+            decision = "matured"
+        elif mean_prob <= float(prune_prob):
+            decision = "rejected"
+
+        stats = {
+            "evidence": float(group["evidence"]),
+            "tests": int(group["tests"]),
+            "prob": mean_prob,
+            "step": step,
+            "count": int(mask.sum().item()),
+            "source": group.get("source", "unknown"),
+        }
+        if decision in ("matured", "rejected"):
+            self.hypothesis_groups.pop(group_id, None)
+        return decision, stats
 
     def update_probation_evidence(
         self,
@@ -255,7 +349,8 @@ class MotionCompensationController:
             + 0.10 * motion_evidence
         ).clamp(0.0, 1.0)
         posterior = (confidence * likelihood).clamp(0.0, 1.0)
-        candidates = posterior >= self.confidence_threshold
+        threshold = self._proposal_threshold(posterior)
+        candidates = posterior >= threshold
 
         self._last_cache = {
             "indices": indices.detach(),
@@ -265,12 +360,13 @@ class MotionCompensationController:
             "grad": residual_evidence.detach(),
             "uncertainty": uncertainty.detach(),
             "candidate_count": int(candidates.sum().item()),
+            "threshold": float(threshold),
         }
         return {
             "posterior_mean": float(posterior.mean().cpu()),
             "posterior_max": float(posterior.max().cpu()),
             "posterior_candidates": float(candidates.sum().cpu()),
-            "posterior_threshold": float(self.confidence_threshold),
+            "posterior_threshold": float(threshold),
             "uncertainty_mean": float(uncertainty.mean().cpu()),
             "residual_evidence_mean": float(residual_evidence.mean().cpu()),
         }
@@ -343,45 +439,119 @@ class MotionCompensationController:
         return loss, stats
 
     @torch.no_grad()
+    def _proposal_threshold(self, score):
+        if score is None or score.numel() == 0:
+            return float(self.confidence_threshold)
+        if self.proposal_min_score >= 0:
+            min_score = self.proposal_min_score
+        else:
+            min_score = self.confidence_threshold
+        if self.proposal_quantile < 1.0 and score.numel() > 1:
+            quantile = min(max(self.proposal_quantile, 0.0), 1.0)
+            quantile_score = float(torch.quantile(score.detach().float(), quantile).cpu())
+            return max(float(min_score), quantile_score)
+        return float(min_score)
+
+    @torch.no_grad()
+    def _select_proposals(self, score):
+        threshold = self._proposal_threshold(score)
+        keep = score >= threshold
+        kept_count = int(keep.sum().item())
+        stats = {
+            "threshold": float(threshold),
+            "gated_count": kept_count,
+            "selected_count": 0,
+            "target_topk": int(self.proposal_topk),
+        }
+        if kept_count == 0:
+            return None, stats
+
+        kept = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+        kept_scores = score[kept]
+        _, order = torch.sort(kept_scores, descending=True)
+        limit = self.max_propagated_points
+        if self.proposal_topk > 0:
+            limit = min(limit, self.proposal_topk)
+        selected = kept[order[:limit]]
+        stats["selected_count"] = int(selected.numel())
+        return selected, stats
+
+    @torch.no_grad()
+    def _apply_spatial_nms(self, selected, gaussians):
+        if selected is None or selected.numel() == 0 or self.proposal_nms_alpha <= 0:
+            return selected
+        parent_indices = self._last_cache["indices"][selected].long()
+        offsets = self._last_cache["corrected_motion"][selected] * self.propagation_scale
+        candidate_xyz = gaussians.get_xyz[parent_indices].detach() + offsets
+        candidate_scale = gaussians.get_scaling[parent_indices].detach().mean(dim=-1).clamp_min(1e-6)
+
+        kept = []
+        for local_idx in range(selected.numel()):
+            if not kept:
+                kept.append(local_idx)
+                continue
+            prev = torch.tensor(kept, device=selected.device, dtype=torch.long)
+            distances = torch.norm(candidate_xyz[prev] - candidate_xyz[local_idx], dim=-1)
+            radii = self.proposal_nms_alpha * torch.maximum(candidate_scale[prev], candidate_scale[local_idx])
+            if not torch.any(distances < radii):
+                kept.append(local_idx)
+        keep_idx = torch.tensor(kept, device=selected.device, dtype=torch.long)
+        return selected[keep_idx]
+
+    @torch.no_grad()
     def last_candidate_stats(self):
         if self._last_cache is None:
             return {}
         score = self._last_cache.get("posterior", self._last_cache.get("confidence"))
         if score is None or score.numel() == 0:
             return {}
-        candidates = score >= self.confidence_threshold
+        selected, selection_stats = self._select_proposals(score)
         probation = int(self.probation_indices.numel()) if self.has_probation() else 0
         return {
             "score_mean": float(score.mean().detach().cpu()),
             "score_max": float(score.max().detach().cpu()),
-            "candidate_count": int(candidates.sum().item()),
-            "threshold": float(self.confidence_threshold),
+            "candidate_count": int(selection_stats["gated_count"]),
+            "selected_count": int(selection_stats["selected_count"]),
+            "nms_count": int(selection_stats.get("nms_count", selection_stats["selected_count"])),
+            "threshold": float(selection_stats["threshold"]),
+            "target_topk": int(selection_stats["target_topk"]),
+            "nms_alpha": float(self.proposal_nms_alpha),
             "probation_count": probation,
         }
 
     @torch.no_grad()
-    def propagate(self, gaussians):
+    def last_selection_stats(self):
+        if self._last_cache is None:
+            return {}
+        return dict(self._last_cache.get("selection_stats", {}))
+
+    @torch.no_grad()
+    def propagate(self, gaussians, time_value=None):
         if self._last_cache is None or self.max_propagated_points <= 0:
             return 0
         score = self._last_cache.get("posterior", self._last_cache["confidence"])
-        keep = score >= self.confidence_threshold
-        if keep.sum() == 0:
+        selected, selection_stats = self._select_proposals(score)
+        if selected is None or selected.numel() == 0:
+            self._last_cache["selection_stats"] = selection_stats
             return 0
-
-        kept = torch.nonzero(keep, as_tuple=False).squeeze(-1)
-        kept_scores = score[kept]
-        _, order = torch.sort(kept_scores, descending=True)
-        selected = kept[order[: self.max_propagated_points]]
+        selected = self._apply_spatial_nms(selected, gaussians)
+        selection_stats["nms_count"] = int(selected.numel())
+        self._last_cache["selection_stats"] = selection_stats
+        if selected.numel() == 0:
+            return 0
         selected_indices = self._last_cache["indices"][selected]
         offsets = self._last_cache["corrected_motion"][selected] * self.propagation_scale
         start_index = gaussians.get_xyz.shape[0]
+        group_id = self.new_hypothesis_group("motion", birth_time=time_value)
         born_points = gaussians.birth_from_existing(
             selected_indices,
             offsets,
-            opacity_scale=0.35,
-            scale_shrink=0.9,
+            opacity_scale=self.birth_opacity_scale,
+            scale_shrink=self.birth_scale_shrink,
+            hypothesis_group_id=group_id,
+            existence_prob=getattr(self, "hypothesis_initial_prob", 0.999),
         )
-        self.register_probation(start_index, born_points)
+        self.register_probation(start_index, born_points, group_id=group_id)
         return born_points
 
     def save(self, path):
