@@ -30,18 +30,21 @@ MCCGS explores this as a posterior-guided Gaussian hypothesis problem:
 - Motion-compensated Gaussian propagation.
 - Bayesian-style posterior scoring for conservative Gaussian completion.
 - CVTE-style held-out verification for tentative Gaussian hypotheses.
-- Adaptive and edge-aware CVTE variants for detail-sensitive verification.
+- Residual-ray Gaussian birth for regions that are poorly explained by the current model.
 - Render-time loading of learned pose correction.
 - Per-frame 3DGS export utilities for comparison/debugging.
 
-The current best two-frame smoke-test direction is the `r9` setting:
+The current final implementation tracks the `r11` setting:
 
 ```text
 pose refinement
 + motion-compensated proposal
-+ edge-aware CVTE verification
-+ posterior-guided conservative Gaussian completion
++ residual-ray Gaussian birth
++ multi-view CVTE verification
++ conservative Gaussian completion
 ```
+
+Later variants such as projection-support CVTE and reveal-prior birth remain useful ablations, but the current code path is kept at `r11` because it was the most stable two-frame candidate in the available metrics.
 
 ## Repository Layout
 
@@ -61,9 +64,8 @@ utils/
   motion_compensation.py           # posterior-guided motion/CVTE controller
 
 scripts/
-  run_mccgs_r7_2frames.sh          # baseline CVTE smoke test
-  run_mccgs_r8_2frames.sh          # adaptive multi-view CVTE test
-  run_mccgs_r9_2frames.sh          # edge-aware CVTE test
+  run_mccgs_final_2frames.sh       # final r11 two-frame smoke test
+  run_mccgs_final_10frames.sh      # final r11 ten-frame experiment
   render_eval_mccgs_r*_2frames.sh  # render/evaluate two-frame experiments
 
 train.py                           # training loop with MCCGS options
@@ -122,13 +124,19 @@ python movable_camera_cluster/scripts/prepare_4dgs_dataset.py \
 
 ## Training
 
-Example: MCCGS `r9` two-frame edge-aware CVTE experiment at 14k iterations.
+Example: MCCGS final `r11` two-frame experiment at 14k iterations.
 
 ```bash
 cd /data3/isyang/Workspace
 conda activate Gaussians4D
 
-bash movable_camera_cluster/4DGaussians_mcc/scripts/run_mccgs_r9_2frames.sh
+bash movable_camera_cluster/4DGaussians_mcc/scripts/run_mccgs_final_2frames.sh
+```
+
+Ten-frame experiment:
+
+```bash
+bash movable_camera_cluster/4DGaussians_mcc/scripts/run_mccgs_final_10frames.sh
 ```
 
 ## Rendering
@@ -137,7 +145,8 @@ bash movable_camera_cluster/4DGaussians_mcc/scripts/run_mccgs_r9_2frames.sh
 cd /data3/isyang/Workspace
 conda activate Gaussians4D
 
-bash movable_camera_cluster/4DGaussians_mcc/scripts/render_eval_mccgs_r9_2frames.sh
+bash movable_camera_cluster/4DGaussians_mcc/scripts/render_eval_mccgs_final_2frames.sh
+bash movable_camera_cluster/4DGaussians_mcc/scripts/render_eval_mccgs_final_10frames.sh
 ```
 
 ## Notes On The Current Method
@@ -160,18 +169,20 @@ delta      = loss(R_without, GT) - loss(R_full, GT)
 
 Positive delta means the probation hypotheses help the held-out render. Negative delta means they hurt and should be pruned or downweighted.
 
-The current implementation includes three experimental variants:
+The current final candidate is `r11`. Earlier and later variants are kept as ablations:
 
 - `r7`: basic CVTE smoke test with conservative hypothesis verification.
-- `r8`: adaptive multi-view CVTE, using recent delta statistics to estimate a local noise floor instead of relying only on a fixed threshold.
-- `r9`: edge-aware CVTE, adding image-gradient error to the verification loss so high-frequency structures such as building textures, dinosaur surfaces, and tree foliage contribute more strongly to the hypothesis score.
+- `r9`: edge-aware CVTE.
+- `r11`: motion proposal + residual-ray birth + multi-view CVTE. This is the current final candidate.
+- `r14`: projection-support CVTE ablation.
+- `r17`: reveal-prior birth ablation; useful conceptually, but not kept in the final code path because it did not improve the two-frame metric.
 
-In the first two-frame test split, `r9` improved perceptual quality over `r7` while preserving PSNR:
+In the first two-frame test split, `r11` was the strongest stable candidate:
 
 ```text
-r7: PSNR 25.6325, SSIM 0.8993, LPIPS-VGG 0.1345, LPIPS-Alex 0.1276
-r8: PSNR 24.2709, SSIM 0.8983, LPIPS-VGG 0.1351, LPIPS-Alex 0.1298
-r9: PSNR 25.6416, SSIM 0.8991, LPIPS-VGG 0.1325, LPIPS-Alex 0.1253
+r11: PSNR 25.7571, SSIM 0.9016, LPIPS-VGG 0.1297, LPIPS-Alex 0.1220
+r14: PSNR 25.7270, SSIM 0.9010, LPIPS-VGG 0.1318, LPIPS-Alex 0.1239
+r17: PSNR 25.6367, SSIM 0.8998, LPIPS-VGG 0.1335, LPIPS-Alex 0.1259
 ```
 
 These numbers are early ablation results, not final benchmark claims. They are useful mainly for comparing MCCGS hypothesis-generation variants under the same two-frame smoke-test setting.
@@ -196,13 +207,14 @@ The main CVTE-related training flags are:
 --mcc_verify_edge_weight
 ```
 
-The `r9` script enables edge-aware CVTE with:
+The final `r11` scripts use multi-view verification with residual and edge evidence:
 
 ```text
 --mcc_verify_views 3
---mcc_verify_adaptive
 --mcc_verify_l1_weight 1.0
 --mcc_verify_edge_weight 0.25
+--mcc_verify_accept_threshold 0.00001
+--mcc_verify_reject_threshold -0.00001
 ```
 
 ## Acknowledgements
